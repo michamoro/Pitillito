@@ -5,6 +5,7 @@ A small, playful Android app where you can talk to Pitillito, an animated straw 
 ## Features
 
 - Ask questions in Spanish by voice and see a temporary transcript on screen.
+- Tap Pitillito to trigger a cheerful or disgusted expression.
 - Watch Pitillito react with curious, thinking, and speaking expressions.
 - Try five sample questions narrated in a gentle Spanish voice before Pitillito replies.
 - See a brief privacy notice when the app opens.
@@ -15,6 +16,7 @@ A small, playful Android app where you can talk to Pitillito, an animated straw 
 - The app requests speech recognition provided on the device. It does not upload audio or transcripts to an app server. If offline speech recognition is unavailable, the app explains this and does not fall back to cloud recognition.
 - The transcript is shown temporarily and removed from the screen after the reply. The app does not write it to disk.
 - Android's installed text-to-speech engine generates the spoken reply; the app does not record or store audio.
+- The microphone button shows when listening starts and gives specific guidance if the offline speech service, language model, or microphone permission is unavailable.
 - Android, the speech engine provider, and device settings manage their own services and data policies, which are outside this app's control.
 
 ## Install on Android

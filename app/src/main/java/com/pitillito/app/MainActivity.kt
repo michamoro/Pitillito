@@ -25,6 +25,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -38,6 +39,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -83,7 +85,7 @@ private val Coral = Color(0xFFE85D57)
 private val Muted = Color(0xFF77818A)
 private val Mint = Color(0xFFE6F3EC)
 
-private enum class MascotMood { IDLE, LISTENING, THINKING, CONFIDENT, SPEAKING }
+private enum class MascotMood { IDLE, LISTENING, THINKING, CONFIDENT, SPEAKING, JOY, DISGUST }
 
 private fun makeStrawStripeCenters(): List<Offset> {
     val pathPoints = buildList {
@@ -142,6 +144,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var replyScheduled = false
     private var latestTranscript = ""
     private var pendingAnswerTranscript = ""
+    private var interactionReset: Runnable? = null
 
     private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) beginListening() else update("Permite el micrófono para preguntarme.", "")
@@ -168,6 +171,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     transcript = transcript,
                     mood = mood,
                     onTemplateQuestion = { question -> narrateTemplateQuestion(question) },
+                    onMascotTap = { reactToMascotTap() },
                     onAsk = {
                         if (mood == MascotMood.LISTENING) stopAndReply()
                         else if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
@@ -243,16 +247,39 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         runOnUiThread { screenUpdate?.invoke(status, transcript, mood) }
     }
 
+    private fun reactToMascotTap() {
+        if (replyScheduled || awaitingResult) return
+        interactionReset?.let(handler::removeCallbacks)
+        val reaction = listOf(MascotMood.JOY, MascotMood.DISGUST).random()
+        val message = when (reaction) {
+            MascotMood.JOY -> "¡Je, je! ¡Eso me gusta!"
+            MascotMood.DISGUST -> "¡Puaj! Esa cosquilla no me gustó…"
+            else -> "¡Je, je!"
+        }
+        update(message, "", reaction)
+        interactionReset = Runnable { update("Estoy listo para escuchar", "", MascotMood.IDLE) }
+        handler.postDelayed(interactionReset!!, 1500)
+    }
+
     private fun beginListening() {
         replyRunnable?.let(handler::removeCallbacks)
         replyRunnable = null
         replyScheduled = false
         tts?.stop()
-        if (!SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             latestTranscript = ""
-            update("Este móvil no tiene reconocimiento de voz sin conexión. Puedes activarlo en sus ajustes de voz.", "")
+            update("Este móvil no tiene un servicio de reconocimiento de voz disponible. Revisa sus ajustes de voz.", "")
             return
         }
+        if (!SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) {
+            latestTranscript = ""
+            awaitingResult = false
+            update("No encuentro reconocimiento de voz sin conexión en este móvil. Activa o descarga el idioma español en sus ajustes de voz.", "")
+            return
+        }
+        latestTranscript = ""
+        awaitingResult = true
+        update("Preparando el micrófono…", "", MascotMood.LISTENING)
         runCatching {
             recognizer?.destroy()
             recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(this).apply {
@@ -266,7 +293,16 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                         awaitingResult = false
                         val gotQuestion = latestTranscript.isNotBlank()
                         if (gotQuestion) answer()
-                        else { latestTranscript = ""; update(if (error == SpeechRecognizer.ERROR_NO_MATCH) "No te he oído. ¿Lo intentamos otra vez?" else "Uy, no he podido escuchar. Prueba de nuevo.", "") }
+                        else {
+                            latestTranscript = ""
+                            val message = when (error) {
+                                SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No te he oído. Toca el botón y prueba otra vez."
+                                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "No tengo permiso para usar el micrófono. Actívalo en Ajustes > Aplicaciones > Pitillito."
+                                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "El micrófono está ocupado. Espera un segundo y prueba de nuevo."
+                                else -> "Uy, no he podido escuchar (error $error). Revisa el reconocimiento de voz sin conexión y prueba otra vez."
+                            }
+                            update(message, "")
+                        }
                     }
                     override fun onResults(results: Bundle?) {
                         awaitingResult = false
@@ -290,7 +326,8 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             }
         }.onFailure {
             latestTranscript = ""
-            update("Uy, no he podido activar el micrófono. Prueba otra vez.", "")
+            awaitingResult = false
+            update("No he podido iniciar el micrófono. Comprueba el permiso de audio y prueba otra vez.", "")
         }
     }
 
@@ -355,6 +392,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     }
 
     override fun onDestroy() {
+        interactionReset?.let(handler::removeCallbacks)
         speakingFallback?.let(handler::removeCallbacks)
         recognizer?.destroy()
         tts?.stop()
@@ -373,6 +411,7 @@ private fun PitillitoHome(
     transcript: String,
     mood: MascotMood,
     onTemplateQuestion: (String) -> Unit,
+    onMascotTap: () -> Unit,
     onAsk: () -> Unit
 ) {
     val strawStripeCenters = remember { makeStrawStripeCenters() }
@@ -412,7 +451,15 @@ private fun PitillitoHome(
                     .background(Color(0xFFF8EEE2), RoundedCornerShape(30.dp)),
                 contentAlignment = Alignment.Center
             ) {
-                Canvas(modifier = Modifier.size(width = 210.dp, height = 335.dp).scale(if (mood == MascotMood.LISTENING) 1.01f + curiousPulse * 0.025f else bob)) {
+                Canvas(
+                    modifier = Modifier.size(width = 210.dp, height = 335.dp)
+                        .scale(if (mood == MascotMood.LISTENING) 1.01f + curiousPulse * 0.025f else bob)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = onMascotTap
+                        )
+                ) {
                     val sx = size.width / 210f
                     val sy = size.height / 335f
                     drawContext.transform.scale(sx, sy, Offset.Zero)
@@ -463,8 +510,24 @@ private fun PitillitoHome(
                         drawLine(Ink, Offset(54f, 61f + browLift), Offset(83f, 54f + browLift), strokeWidth = 5f, cap = StrokeCap.Round)
                         drawLine(Ink, Offset(132f, 62f + browLift), Offset(161f, 66f + browLift), strokeWidth = 5f, cap = StrokeCap.Round)
                     }
-                    val smile = Path().apply { moveTo(104f, 113f); cubicTo(109f, if (mood == MascotMood.SPEAKING) 129f else 122f, 119f, if (mood == MascotMood.SPEAKING) 129f else 122f, 124f, 114f) }
-                    drawPath(smile, Coral, style = Stroke(width = 3.5f, cap = StrokeCap.Round))
+                    when (mood) {
+                        MascotMood.DISGUST -> {
+                            drawLine(Ink, Offset(54f, 57f), Offset(83f, 65f), strokeWidth = 5f, cap = StrokeCap.Round)
+                            drawLine(Ink, Offset(132f, 67f), Offset(161f, 59f), strokeWidth = 5f, cap = StrokeCap.Round)
+                            val frown = Path().apply { moveTo(104f, 121f); cubicTo(109f, 110f, 119f, 110f, 124f, 121f) }
+                            drawPath(frown, Coral, style = Stroke(width = 4f, cap = StrokeCap.Round))
+                        }
+                        MascotMood.JOY -> {
+                            val happy = Path().apply { moveTo(101f, 112f); cubicTo(107f, 134f, 121f, 134f, 128f, 112f) }
+                            drawPath(happy, Coral, style = Stroke(width = 4.5f, cap = StrokeCap.Round))
+                            drawCircle(Color(0xFFFFC3AE), 7f, Offset(52f, 122f))
+                            drawCircle(Color(0xFFFFC3AE), 7f, Offset(171f, 127f))
+                        }
+                        else -> {
+                            val smile = Path().apply { moveTo(104f, 113f); cubicTo(109f, if (mood == MascotMood.SPEAKING) 129f else 122f, 119f, if (mood == MascotMood.SPEAKING) 129f else 122f, 124f, 114f) }
+                            drawPath(smile, Coral, style = Stroke(width = 3.5f, cap = StrokeCap.Round))
+                        }
+                    }
                     drawCircle(Color(0xFFFFC3AE), 5f, Offset(52f, 122f))
                     drawCircle(Color(0xFFFFC3AE), 5f, Offset(171f, 127f))
                     drawContext.transform.scale(1f / sx, 1f / sy, Offset.Zero)
@@ -486,14 +549,17 @@ private fun PitillitoHome(
             Spacer(Modifier.height(15.dp))
             Button(
                 onClick = onAsk,
-                enabled = mood == MascotMood.IDLE || mood == MascotMood.LISTENING,
+                enabled = mood == MascotMood.IDLE || mood == MascotMood.LISTENING ||
+                    mood == MascotMood.JOY || mood == MascotMood.DISGUST,
                 modifier = Modifier.fillMaxWidth().height(60.dp).shadow(8.dp, RoundedCornerShape(20.dp)),
                 shape = RoundedCornerShape(20.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = if (mood == MascotMood.LISTENING) Ink else Coral, contentColor = Color.White)
             ) {
                 Text(when (mood) {
                     MascotMood.LISTENING -> "■   Ya está, Pitillito"
-                    MascotMood.THINKING, MascotMood.CONFIDENT, MascotMood.SPEAKING -> "Pitillito está pensando…"
+                    MascotMood.THINKING, MascotMood.SPEAKING -> "Pitillito está pensando…"
+                    MascotMood.CONFIDENT -> "¡Pitillito tiene una idea!"
+                    MascotMood.JOY, MascotMood.DISGUST -> "Pitillito está reaccionando…"
                     MascotMood.IDLE -> "🎙   Preguntar a Pitillito"
                 }, fontSize = 16.sp, fontWeight = FontWeight.Bold)
             }
