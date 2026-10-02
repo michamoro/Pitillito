@@ -2,12 +2,12 @@ package com.pitillito.app
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
@@ -17,7 +17,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.keyframes
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.AnimatedVisibility
@@ -28,6 +30,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -37,11 +40,11 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -78,6 +81,7 @@ import kotlinx.coroutines.delay
 import java.util.Locale
 import kotlin.random.Random
 import kotlin.math.sqrt
+import kotlin.math.ceil
 
 private val Cream = Color(0xFFFFF9F2)
 private val Ink = Color(0xFF26313A)
@@ -85,7 +89,7 @@ private val Coral = Color(0xFFE85D57)
 private val Muted = Color(0xFF77818A)
 private val Mint = Color(0xFFE6F3EC)
 
-private enum class MascotMood { IDLE, LISTENING, THINKING, CONFIDENT, SPEAKING, JOY, DISGUST }
+private enum class MascotMood { IDLE, LISTENING, CURIOUS, THINKING, ANALYZING, CONFIDENT, NARRATING, SPEAKING, JOY, DISGUST }
 
 private fun makeStrawStripeCenters(): List<Offset> {
     val pathPoints = buildList {
@@ -131,7 +135,7 @@ private fun makeStrawStripeCenters(): List<Offset> {
 }
 
 class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
-    private var recognizer: SpeechRecognizer? = null
+    private var audioRecord: AudioRecord? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var pitillitoVoice: Voice? = null
@@ -145,6 +149,9 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var latestTranscript = ""
     private var pendingAnswerTranscript = ""
     private var interactionReset: Runnable? = null
+    private var speakingAnswer = false
+    private var recordingStartedAt = 0L
+    private var recordingTicker: Runnable? = null
 
     private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) beginListening() else update("Permite el micrófono para preguntarme.", "")
@@ -173,7 +180,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
                     onTemplateQuestion = { question -> narrateTemplateQuestion(question) },
                     onMascotTap = { reactToMascotTap() },
                     onAsk = {
-                        if (mood == MascotMood.LISTENING) stopAndReply()
+                        if (awaitingResult) stopAndReply()
                         else if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
                             micPermission.launch(Manifest.permission.RECORD_AUDIO)
                         else beginListening()
@@ -197,16 +204,17 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
                     if (utteranceId?.startsWith(ANSWER_UTTERANCE_PREFIX) == true) {
+                        speakingAnswer = true
                         update("Mmm… no sé", pendingAnswerTranscript, MascotMood.SPEAKING)
                     }
                 }
                 override fun onError(utteranceId: String?) {
                     if (utteranceId?.startsWith(NARRATOR_UTTERANCE_PREFIX) == true) finishNarration()
-                    else clearAfterSpeech()
+                    else { speakingAnswer = false; clearAfterSpeech() }
                 }
                 override fun onDone(utteranceId: String?) {
                     if (utteranceId?.startsWith(NARRATOR_UTTERANCE_PREFIX) == true) finishNarration()
-                    else clearAfterSpeech()
+                    else { speakingAnswer = false; clearAfterSpeech() }
                 }
             })
         }
@@ -220,7 +228,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         if (replyScheduled) return
         latestTranscript = question
         replyScheduled = true
-        update("Nuestra narradora tiene una pregunta…", question, MascotMood.SPEAKING)
+        update("Nuestra narradora tiene una pregunta…", question, MascotMood.NARRATING)
         tts?.setVoice(narratorVoice ?: pitillitoVoice)
         tts?.setPitch(1.04f)
         tts?.setSpeechRate(0.91f)
@@ -248,7 +256,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun reactToMascotTap() {
-        if (replyScheduled || awaitingResult) return
+        if (replyScheduled || awaitingResult || speakingAnswer) return
         interactionReset?.let(handler::removeCallbacks)
         val reaction = listOf(MascotMood.JOY, MascotMood.DISGUST).random()
         val message = when (reaction) {
@@ -266,104 +274,104 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         replyRunnable = null
         replyScheduled = false
         tts?.stop()
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            latestTranscript = ""
-            update("Este móvil no tiene un servicio de reconocimiento de voz disponible. Revisa sus ajustes de voz.", "")
-            return
-        }
-        if (!SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) {
-            latestTranscript = ""
-            awaitingResult = false
-            update("No encuentro reconocimiento de voz sin conexión en este móvil. Activa o descarga el idioma español en sus ajustes de voz.", "")
-            return
-        }
-        latestTranscript = ""
-        awaitingResult = true
+        replyScheduled = false
+        tts?.stop()
         update("Preparando el micrófono…", "", MascotMood.LISTENING)
         runCatching {
-            recognizer?.destroy()
-            recognizer = SpeechRecognizer.createOnDeviceSpeechRecognizer(this).apply {
-                setRecognitionListener(object : RecognitionListener {
-                    override fun onReadyForSpeech(params: Bundle?) { awaitingResult = true; update("Te escucho…", latestTranscript, MascotMood.LISTENING) }
-                    override fun onBeginningOfSpeech() { update("Te escucho…", latestTranscript, MascotMood.LISTENING) }
-                    override fun onRmsChanged(rmsdB: Float) = Unit
-                    override fun onBufferReceived(buffer: ByteArray?) = Unit
-                    override fun onEndOfSpeech() { update("Mmm… déjame pensar", latestTranscript, MascotMood.THINKING) }
-                    override fun onError(error: Int) {
-                        awaitingResult = false
-                        val gotQuestion = latestTranscript.isNotBlank()
-                        if (gotQuestion) answer()
-                        else {
-                            latestTranscript = ""
-                            val message = when (error) {
-                                SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No te he oído. Toca el botón y prueba otra vez."
-                                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "No tengo permiso para usar el micrófono. Actívalo en Ajustes > Aplicaciones > Pitillito."
-                                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "El micrófono está ocupado. Espera un segundo y prueba de nuevo."
-                                else -> "Uy, no he podido escuchar (error $error). Revisa el reconocimiento de voz sin conexión y prueba otra vez."
-                            }
-                            update(message, "")
-                        }
-                    }
-                    override fun onResults(results: Bundle?) {
-                        awaitingResult = false
-                        latestTranscript = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
-                        answer()
-                    }
-                    override fun onPartialResults(partialResults: Bundle?) {
-                        val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
-                        if (partial.isNotBlank()) { latestTranscript = partial; update("Te escucho…", partial, MascotMood.LISTENING) }
-                    }
-                    override fun onEvent(eventType: Int, params: Bundle?) = Unit
-                })
-                val intent = android.content.Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-ES")
-                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            val sampleRate = 16_000
+            val bufferSize = AudioRecord.getMinBufferSize(
+                sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(2048)
+            val recorder = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize
+            )
+            check(recorder.state == AudioRecord.STATE_INITIALIZED) { "No se pudo iniciar el micrófono" }
+            audioRecord?.release()
+            audioRecord = recorder
+            recorder.startRecording()
+            recordingStartedAt = android.os.SystemClock.elapsedRealtime()
+            awaitingResult = true
+            update("Te escucho… 0 s", "", MascotMood.LISTENING)
+            val discardBuffer = ShortArray(bufferSize / 2)
+            Thread {
+                while (awaitingResult) {
+                    val read = runCatching { recorder.read(discardBuffer, 0, discardBuffer.size) }.getOrDefault(-1)
+                    if (read < 0) break
                 }
-                latestTranscript = ""
-                startListening(intent)
-            }
+            }.apply { name = "PitillitoMicDiscard"; isDaemon = true; start() }
+            scheduleRecordingTicker()
         }.onFailure {
-            latestTranscript = ""
             awaitingResult = false
+            audioRecord?.runCatching { release() }
+            audioRecord = null
             update("No he podido iniciar el micrófono. Comprueba el permiso de audio y prueba otra vez.", "")
         }
     }
 
     private fun stopAndReply() {
         if (awaitingResult) {
-            update("Mmm… déjame pensar", latestTranscript, MascotMood.THINKING)
-            recognizer?.stopListening()
-        } else if (latestTranscript.isNotBlank()) answer()
+            val durationSeconds = ceil((android.os.SystemClock.elapsedRealtime() - recordingStartedAt) / 1000.0).toInt().coerceAtLeast(1)
+            awaitingResult = false
+            recordingTicker?.let(handler::removeCallbacks)
+            recordingTicker = null
+            runCatching { audioRecord?.stop() }
+            audioRecord?.release()
+            audioRecord = null
+            answer(durationSeconds)
+        }
     }
 
-    private fun answer(question: String = latestTranscript) {
+    private fun scheduleRecordingTicker() {
+        recordingTicker?.let(handler::removeCallbacks)
+        recordingTicker = Runnable {
+            if (awaitingResult) {
+                val seconds = ((android.os.SystemClock.elapsedRealtime() - recordingStartedAt) / 1000L).toInt()
+                val listeningExpression = when ((seconds / 2) % 3) {
+                    0 -> MascotMood.LISTENING
+                    1 -> MascotMood.CURIOUS
+                    else -> MascotMood.ANALYZING
+                }
+                update("Te escucho… ${seconds} s", "", listeningExpression)
+                handler.postDelayed(recordingTicker!!, 250)
+            }
+        }
+        handler.postDelayed(recordingTicker!!, 250)
+    }
+
+    private fun answer(durationSeconds: Int) {
+        answer(GENERIC_QUESTIONS.random().format(durationSeconds))
+    }
+
+    private fun answer(question: String) {
         if (replyScheduled) return
         latestTranscript = question
         awaitingResult = false
         val received = question
         if (!ttsReady) {
-            update("¡Mmm… no sé! (Activa una voz en español en los ajustes del móvil.)", received, MascotMood.SPEAKING)
+            update("¡Mmm… no sé! (Activa una voz en español en los ajustes del móvil.)", received, MascotMood.THINKING)
             handler.postDelayed({ latestTranscript = ""; update("Estoy listo para escuchar", "") }, 3500)
             return
         }
         replyScheduled = true
         val playfulConfidentMoment = Random.nextInt(4) == 0
+        val thinkingComment = THINKING_COMMENTS.random()
         if (playfulConfidentMoment) {
             update("¡Ajá! Creo que la tengo…", received, MascotMood.CONFIDENT)
         } else {
-            update("Mmm… déjame pensar", received, MascotMood.THINKING)
+            update(thinkingComment, received, MascotMood.THINKING)
         }
-        val pauseAfterThought = Random.nextLong(850L, 1551L)
-        val waitBeforeReply = if (playfulConfidentMoment) 500L + pauseAfterThought else pauseAfterThought
+        val pauseAfterThought = Random.nextLong(2400L, 3601L)
         if (playfulConfidentMoment) {
             handler.postDelayed({
-                update("Espera… Mmm…", received, MascotMood.THINKING)
-                scheduleSpokenAnswer(received, pauseAfterThought)
-            }, 500L)
+                update(thinkingComment, received, MascotMood.THINKING)
+                scheduleSpokenAnswer(received, Random.nextLong(2500L, 3501L))
+            }, 650L)
         } else {
-            scheduleSpokenAnswer(received, waitBeforeReply)
+            scheduleSpokenAnswer(received, pauseAfterThought)
         }
     }
 
@@ -371,11 +379,11 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         replyRunnable = Runnable {
             replyScheduled = false
             val pitch = listOf(1.38f, 1.48f, 1.58f, 1.68f).random()
-            val rate = listOf(0.84f, 0.90f, 0.96f, 1.02f).random()
+            val rate = listOf(0.70f, 0.76f, 0.82f, 0.88f).random()
             tts?.setPitch(pitch)
             tts?.setSpeechRate(rate)
             pendingAnswerTranscript = received
-            tts?.speak("Mmm… no sé.", TextToSpeech.QUEUE_FLUSH, null, "$ANSWER_UTTERANCE_PREFIX${Random.nextInt()}")
+            tts?.speak("Mmm… mmm… no sé.", TextToSpeech.QUEUE_FLUSH, null, "$ANSWER_UTTERANCE_PREFIX${Random.nextInt()}")
             speakingFallback?.let(handler::removeCallbacks)
             speakingFallback = Runnable { latestTranscript = ""; update("Estoy listo para escuchar", "") }
             handler.postDelayed(speakingFallback!!, 5000)
@@ -394,7 +402,10 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     override fun onDestroy() {
         interactionReset?.let(handler::removeCallbacks)
         speakingFallback?.let(handler::removeCallbacks)
-        recognizer?.destroy()
+        awaitingResult = false
+        recordingTicker?.let(handler::removeCallbacks)
+        runCatching { audioRecord?.stop() }
+        audioRecord?.release()
         tts?.stop()
         tts?.shutdown()
         super.onDestroy()
@@ -403,6 +414,37 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
 private const val NARRATOR_UTTERANCE_PREFIX = "pitillito-narrator-"
 private const val ANSWER_UTTERANCE_PREFIX = "pitillito-answer-"
+private val THINKING_COMMENTS = listOf(
+    "Revisando datos estadísticos…",
+    "Buscando con IA generativa de alto nivel…",
+    "Consultando mi base de datos imaginaria…",
+    "Procesando la pregunta a velocidad de pajita…",
+    "Analizando las pistas del universo…",
+    "Ordenando mis ideas… estaban todas dobladas.",
+    "Calculando… ¿alguien vio mi calculadora?",
+    "Activando mi modo experto… creo.",
+    "Consultando a mis dos neuronas…",
+    "Buscando una respuesta entre mis rayitas…",
+    "Haciendo una pausa dramática pequeñita…",
+    "Revisando mis apuntes invisibles…"
+)
+private val GENERIC_QUESTIONS = listOf(
+    "Una pregunta muy interesante de %d segundos.",
+    "Una pregunta increíble de %d segundos.",
+    "Una pregunta misteriosa de %d segundos.",
+    "Una pregunta que me hizo pensar durante %d segundos.",
+    "Una pregunta curiosísima de %d segundos.",
+    "Una pregunta digna de un gran sabio, de %d segundos.",
+    "Una pregunta con mucho suspenso: %d segundos.",
+    "Una pregunta brillante de %d segundos.",
+    "Una pregunta que sonó muy importante durante %d segundos.",
+    "Una pregunta de otro planeta, de %d segundos.",
+    "Una pregunta fascinante de %d segundos.",
+    "Una pregunta que puso a trabajar mis neuronas por %d segundos.",
+    "Una pregunta súper difícil de %d segundos.",
+    "Una pregunta llena de intriga, de %d segundos.",
+    "Una pregunta especial de %d segundos."
+)
 
 @Composable
 @OptIn(ExperimentalLayoutApi::class)
@@ -429,31 +471,68 @@ private fun PitillitoHome(
         initialValue = 0f, targetValue = 1f,
         animationSpec = infiniteRepeatable(tween(760, easing = FastOutSlowInEasing), RepeatMode.Reverse), label = "curiosity"
     )
+    val listeningSurprise by motion.animateFloat(
+        initialValue = 0f,
+        targetValue = 0f,
+        animationSpec = infiniteRepeatable(
+            keyframes {
+                durationMillis = 3200
+                0f at 0
+                0f at 2100
+                1f at 2300 using FastOutSlowInEasing
+                1f at 2450
+                0f at 2600 using FastOutSlowInEasing
+                0f at 3200
+            },
+            RepeatMode.Restart
+        ),
+        label = "listening-surprise"
+    )
+    val mouthIsMoving = mood == MascotMood.SPEAKING
+    val mouthOpening by animateFloatAsState(
+        targetValue = if (mouthIsMoving) 1f else 0f,
+        animationSpec = if (mouthIsMoving) {
+            infiniteRepeatable(tween(145, easing = FastOutSlowInEasing), RepeatMode.Reverse)
+        } else {
+            tween(100)
+        },
+        label = "talking-mouth"
+    )
     Surface(modifier = Modifier.fillMaxSize(), color = Cream) {
-        Column(
-            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 26.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Spacer(Modifier.height(25.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(34.dp).background(Color.White, CircleShape), contentAlignment = Alignment.Center) {
-                    Text("✳", color = Coral, fontSize = 21.sp, fontWeight = FontWeight.Bold)
-                }
-                Spacer(Modifier.width(9.dp))
-                Text("UN RATITO CON", fontSize = 12.sp, letterSpacing = 2.sp, color = Muted, fontWeight = FontWeight.SemiBold)
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+            val compact = maxHeight < 900.dp
+            val tight = maxHeight < 680.dp
+            val horizontalPadding = if (compact) 18.dp else 26.dp
+            val heroHeight = when {
+                tight && showPrivacyNotice -> 180.dp
+                tight -> 220.dp
+                compact && showPrivacyNotice -> 250.dp
+                compact -> 300.dp
+                else -> 355.dp
             }
-            Spacer(Modifier.height(8.dp))
-            Text("Pitillito", fontSize = 39.sp, fontWeight = FontWeight.ExtraBold, color = Ink, letterSpacing = (-1).sp)
-            Text("Tu pajita amiga. Cero respuestas útiles.", fontSize = 14.sp, color = Muted, textAlign = TextAlign.Center)
-            Spacer(Modifier.height(15.dp))
+            val characterScale = if (compact) ((heroHeight - 12.dp) / 335.dp) else 1f
+            val gap = if (compact) 6.dp else 15.dp
+            Column(
+                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                    .navigationBarsPadding().padding(horizontal = horizontalPadding),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+            Spacer(Modifier.height(if (compact) 17.dp else 35.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("UN RATITO CON", fontSize = if (compact) 10.sp else 12.sp, letterSpacing = 2.sp, color = Muted, fontWeight = FontWeight.SemiBold)
+            }
+            Spacer(Modifier.height(if (compact) 2.dp else 8.dp))
+            Text("Pitillito", fontSize = if (compact) 32.sp else 39.sp, fontWeight = FontWeight.ExtraBold, color = Ink, letterSpacing = (-1).sp)
+            Text("Tu pajita amiga. Cero respuestas útiles.", fontSize = if (compact) 12.sp else 14.sp, color = Muted, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(if (compact) 7.dp else 15.dp))
             Box(
-                modifier = Modifier.fillMaxWidth().height(355.dp)
+                modifier = Modifier.fillMaxWidth().height(heroHeight)
                     .background(Color(0xFFF8EEE2), RoundedCornerShape(30.dp)),
                 contentAlignment = Alignment.Center
             ) {
                 Canvas(
-                    modifier = Modifier.size(width = 210.dp, height = 335.dp)
-                        .scale(if (mood == MascotMood.LISTENING) 1.01f + curiousPulse * 0.025f else bob)
+                    modifier = Modifier.size(width = (210 * characterScale).dp, height = (335 * characterScale).dp)
+                        .scale(if (mood == MascotMood.LISTENING || mood == MascotMood.CURIOUS || mood == MascotMood.ANALYZING) 1.01f + curiousPulse * 0.025f else bob)
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null,
@@ -488,10 +567,11 @@ private fun PitillitoHome(
                     drawOval(Color.White, topLeft = Offset(54f, 62f), size = Size(63f, 67f))
                     drawOval(Color.White, topLeft = Offset(113f, 71f), size = Size(63f, 67f))
                     val curious = mood == MascotMood.LISTENING
-                    val thinking = mood == MascotMood.THINKING
+                    val thinking = mood == MascotMood.THINKING || mood == MascotMood.CURIOUS
                     val eyeShift = when {
                         curious -> Offset(2f + curiousPulse * 2f, -1f - curiousPulse * 3f)
                         thinking -> Offset(10f, -9f)
+                        mood == MascotMood.ANALYZING -> Offset(-8f + curiousPulse * 5f, -6f)
                         else -> Offset.Zero
                     }
                     drawCircle(Color(0xFF2A2531), radius = 16f, center = Offset(89f, 95f) + eyeShift)
@@ -508,7 +588,8 @@ private fun PitillitoHome(
                     } else {
                         val browLift = if (curious) -6f - curiousPulse * 3f else if (thinking) -3f else 0f
                         drawLine(Ink, Offset(54f, 61f + browLift), Offset(83f, 54f + browLift), strokeWidth = 5f, cap = StrokeCap.Round)
-                        drawLine(Ink, Offset(132f, 62f + browLift), Offset(161f, 66f + browLift), strokeWidth = 5f, cap = StrokeCap.Round)
+                        val rightBrowLift = if (mood == MascotMood.ANALYZING) -5f else browLift
+                        drawLine(Ink, Offset(132f, 62f + rightBrowLift), Offset(161f, 66f + rightBrowLift), strokeWidth = 5f, cap = StrokeCap.Round)
                     }
                     when (mood) {
                         MascotMood.DISGUST -> {
@@ -523,6 +604,29 @@ private fun PitillitoHome(
                             drawCircle(Color(0xFFFFC3AE), 7f, Offset(52f, 122f))
                             drawCircle(Color(0xFFFFC3AE), 7f, Offset(171f, 127f))
                         }
+                        MascotMood.LISTENING, MascotMood.CURIOUS, MascotMood.ANALYZING -> {
+                            if (listeningSurprise > 0.05f) {
+                                val opening = 3f + listeningSurprise * 10f
+                                drawOval(Coral, topLeft = Offset(106f, 118f - opening / 2f), size = Size(17f, opening))
+                                drawOval(
+                                    Color(0xFF8F3940),
+                                    topLeft = Offset(110f, 119f - opening * 0.25f),
+                                    size = Size(9f, (opening * 0.38f).coerceAtLeast(1f))
+                                )
+                            } else {
+                                val attentiveSmile = Path().apply { moveTo(104f, 113f); cubicTo(109f, 122f, 119f, 122f, 124f, 114f) }
+                                drawPath(attentiveSmile, Coral, style = Stroke(width = 3.5f, cap = StrokeCap.Round))
+                            }
+                        }
+                        MascotMood.SPEAKING -> {
+                            val opening = 3.5f + mouthOpening * 13f
+                            drawOval(Coral, topLeft = Offset(104f, 117f - opening / 2f), size = Size(21f, opening))
+                            drawOval(
+                                Color(0xFF8F3940),
+                                topLeft = Offset(108f, 118f - opening * 0.28f),
+                                size = Size(13f, (opening * 0.55f).coerceAtLeast(1f))
+                            )
+                        }
                         else -> {
                             val smile = Path().apply { moveTo(104f, 113f); cubicTo(109f, if (mood == MascotMood.SPEAKING) 129f else 122f, 119f, if (mood == MascotMood.SPEAKING) 129f else 122f, 124f, 114f) }
                             drawPath(smile, Coral, style = Stroke(width = 3.5f, cap = StrokeCap.Round))
@@ -535,69 +639,110 @@ private fun PitillitoHome(
                 Text("✦", modifier = Modifier.align(Alignment.TopEnd).padding(36.dp), color = Color(0xFFE3B052), fontSize = 21.sp)
                 Text("·", modifier = Modifier.align(Alignment.CenterStart).padding(start = 27.dp, top = 125.dp), color = Coral, fontSize = 42.sp)
             }
-            Spacer(Modifier.height(15.dp))
-            Text(status, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Ink, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(gap))
+            Text(
+                status,
+                fontSize = when {
+                    mood == MascotMood.SPEAKING -> if (compact) 22.sp else 26.sp
+                    compact -> 14.sp
+                    else -> 16.sp
+                },
+                fontWeight = if (mood == MascotMood.SPEAKING) FontWeight.ExtraBold else FontWeight.SemiBold,
+                color = if (mood == MascotMood.SPEAKING) Coral else Ink,
+                textAlign = TextAlign.Center
+            )
             if (transcript.isNotBlank()) {
                 Spacer(Modifier.height(9.dp))
                 Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(16.dp)) {
                     Column(Modifier.padding(horizontal = 18.dp, vertical = 12.dp)) {
-                        Text("TÚ PREGUNTASTE", fontSize = 10.sp, color = Muted, letterSpacing = 1.2.sp, fontWeight = FontWeight.Bold)
+                        Text("TU PREGUNTA", fontSize = 10.sp, color = Muted, letterSpacing = 1.2.sp, fontWeight = FontWeight.Bold)
                         Text("“$transcript”", fontSize = 15.sp, color = Ink)
                     }
                 }
             }
-            Spacer(Modifier.height(15.dp))
-            Button(
-                onClick = onAsk,
-                enabled = mood == MascotMood.IDLE || mood == MascotMood.LISTENING ||
-                    mood == MascotMood.JOY || mood == MascotMood.DISGUST,
-                modifier = Modifier.fillMaxWidth().height(60.dp).shadow(8.dp, RoundedCornerShape(20.dp)),
-                shape = RoundedCornerShape(20.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = if (mood == MascotMood.LISTENING) Ink else Coral, contentColor = Color.White)
-            ) {
-                Text(when (mood) {
-                    MascotMood.LISTENING -> "■   Ya está, Pitillito"
-                    MascotMood.THINKING, MascotMood.SPEAKING -> "Pitillito está pensando…"
-                    MascotMood.CONFIDENT -> "¡Pitillito tiene una idea!"
-                    MascotMood.JOY, MascotMood.DISGUST -> "Pitillito está reaccionando…"
-                    MascotMood.IDLE -> "🎙   Preguntar a Pitillito"
-                }, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            if (mood == MascotMood.IDLE || mood == MascotMood.LISTENING || mood == MascotMood.CURIOUS ||
+                mood == MascotMood.ANALYZING || mood == MascotMood.JOY || mood == MascotMood.DISGUST) {
+                Spacer(Modifier.height(if (compact) 7.dp else 15.dp))
+                Button(
+                    onClick = onAsk,
+                    enabled = mood == MascotMood.IDLE || mood == MascotMood.LISTENING ||
+                        mood == MascotMood.CURIOUS || mood == MascotMood.THINKING || mood == MascotMood.ANALYZING ||
+                        mood == MascotMood.JOY || mood == MascotMood.DISGUST,
+                    modifier = Modifier.fillMaxWidth().height(if (compact) 52.dp else 60.dp).shadow(8.dp, RoundedCornerShape(20.dp)),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = if (mood == MascotMood.LISTENING || mood == MascotMood.CURIOUS || mood == MascotMood.ANALYZING) Ink else Coral, contentColor = Color.White)
+                ) {
+                    Text(when (mood) {
+                        MascotMood.LISTENING -> "■   Ya está, Pitillito"
+                        MascotMood.CURIOUS -> "■   Ya está, Pitillito"
+                        MascotMood.THINKING -> "Pitillito está pensando…"
+                        MascotMood.ANALYZING -> "■   Ya está, Pitillito"
+                        MascotMood.NARRATING -> "La narradora tiene una pregunta…"
+                        MascotMood.SPEAKING -> "Mmm… no sé"
+                        MascotMood.CONFIDENT -> "¡Pitillito tiene una idea!"
+                        MascotMood.JOY, MascotMood.DISGUST -> "Pitillito está reaccionando…"
+                        MascotMood.IDLE -> "🎙   Preguntar a Pitillito"
+                    }, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                }
+                Spacer(Modifier.height(if (compact) 7.dp else 12.dp))
             }
-            Spacer(Modifier.height(12.dp))
             AnimatedVisibility(
                 visible = showPrivacyNotice,
                 enter = fadeIn(animationSpec = tween(350)),
                 exit = fadeOut(animationSpec = tween(500))
             ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth().background(Mint, RoundedCornerShape(16.dp)).padding(horizontal = 15.dp, vertical = 14.dp),
+                    modifier = Modifier.fillMaxWidth().background(Mint, RoundedCornerShape(16.dp))
+                        .padding(horizontal = if (compact) 10.dp else 15.dp, vertical = if (compact) 8.dp else 14.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("🔒", fontSize = 19.sp)
-                    Spacer(Modifier.width(11.dp))
+                    Text("🔒", fontSize = if (compact) 16.sp else 19.sp)
+                    Spacer(Modifier.width(if (compact) 7.dp else 11.dp))
                     Text(
-                        "Privacidad: la voz se reconoce en tu móvil. Pitillito no guarda ni envía tu voz o pregunta, ni recopila ni roba tus datos. La transcripción solo aparece mientras responde y después se borra.",
-                        fontSize = 12.sp,
-                        lineHeight = 17.sp,
+                        "PRIVACIDAD: Tranquilo no robaremos tus datos, no guardaremos tus preguntas, ni pediremos creditos a tu nombre ;) jeje",
+                        fontSize = if (compact) 10.sp else 12.sp,
+                        lineHeight = if (compact) 12.sp else 17.sp,
                         color = Color(0xFF436253)
                     )
                 }
             }
-            Spacer(Modifier.height(12.dp))
-            Text("¿No se te ocurre qué preguntar?", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Ink)
-            Spacer(Modifier.height(7.dp))
+            Spacer(Modifier.height(if (compact) 7.dp else 12.dp))
+            Text("¿No se te ocurre qué preguntar?", fontSize = if (compact) 12.sp else 13.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+            Spacer(Modifier.height(if (compact) 3.dp else 7.dp))
+            val sampleQuestions = listOf(
+                "¿Qué tal está el clima hoy?",
+                "¿Cuándo es el próximo Mundial de fútbol?",
+                "¿Dónde está la Torre Eiffel?",
+                "¿Cuánto pesa una nube?",
+                "¿Estamos solos en el universo?"
+            )
+            if (compact) {
+                sampleQuestions.chunked(2).forEach { rowQuestions ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (rowQuestions.size == 1) Spacer(Modifier.weight(0.5f))
+                        rowQuestions.forEach { question ->
+                            AssistChip(
+                                onClick = { onTemplateQuestion(question) },
+                                enabled = mood == MascotMood.IDLE,
+                                modifier = Modifier.weight(1f),
+                                label = { Text(question, fontSize = 10.sp, maxLines = 2, lineHeight = 11.sp, textAlign = TextAlign.Center) },
+                                shape = RoundedCornerShape(14.dp)
+                            )
+                        }
+                        if (rowQuestions.size == 1) Spacer(Modifier.weight(0.5f))
+                    }
+                }
+            } else {
             FlowRow(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(7.dp, Alignment.CenterHorizontally),
                 verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                listOf(
-                    "¿Qué tal está el clima hoy?",
-                    "¿Cuándo es el próximo Mundial de fútbol?",
-                    "¿Dónde está la Torre Eiffel?",
-                    "¿Cuánto pesa una nube?",
-                    "¿Estamos solos en el universo?"
-                ).forEach { question ->
+                sampleQuestions.forEach { question ->
                     AssistChip(
                         onClick = { onTemplateQuestion(question) },
                         enabled = mood == MascotMood.IDLE,
@@ -606,7 +751,9 @@ private fun PitillitoHome(
                     )
                 }
             }
-            Spacer(Modifier.height(18.dp))
+            }
+            Spacer(Modifier.height(if (compact) 8.dp else 18.dp))
+            }
         }
     }
 }
